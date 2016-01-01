@@ -109,7 +109,7 @@ format '%s'.
 def incompatible_fs_format(repos_path, format):
   """Print an error saying that REPOS_PATH is a repository with an
   incompatible filesystem format FORMAT, then exit."""
-  sys.stderr.write("""error: unable to convert repository '%s'.
+  sys.stderr.write("""error: unable to open repository '%s'.
 
 This repository contains a filesystem that is not compatible with
 this tool.  Valid filesystem formats are '1', '2', or '3'; this
@@ -122,7 +122,7 @@ repository contains a filesystem with format '%s'.
 def unexpected_fs_format_options(repos_path):
   """Print an error saying that REPOS_PATH is a repository with
   unexpected filesystem format options, then exit."""
-  sys.stderr.write("""error: unable to convert repository '%s'.
+  sys.stderr.write("""error: unable to open repository '%s'.
 
 This repository contains a filesystem that appears to be invalid -
 there is unexpected data after the filesystem format number.
@@ -453,9 +453,9 @@ def compute_shard_sizes(revs_size, max_files_per_shard):
     print 'Average full-shard size %d. Minimum: %d, Maximum: %d.' \
           % ((shard_size_sum / current_shard), min_shard_size, max_shard_size)
 
-def linearise_packed_shards(revs_path, current_shard, min_unpacked_rev_path):
+def compute_unpack_shards(revs_path, current_shard, min_unpacked_rev_path):
   """Linearise packed shards in revs_path directory based on
-  current_shard number of revisions per shard.
+  current_shard number of revisions per shard and compute revision sizes.
   min-unpacked-rev at min_unpacked_rev_path is reset to 0."""
   # Suffix unpacked shard to prevent conflicts
   suffix_unpacked_shard(revs_path)
@@ -571,16 +571,14 @@ def main():
   print('- marking the repository as invalid')
   backup_fs_format(repos_path)
 
-  # First, convert to a linear scheme (this makes recovery easier because
-  # it's easier to reason about the behaviour on restart).
+  # First, convert to a linear scheme (this makes recovery easier)
   if fs_format[1] > 0:
     revs_path = os.path.join(repos_path, 'db', 'revs')
     if min_unpacked_rev > 0:
-      print('- linearising db/revs (unpacking first)')
-      linearise_packed_shards(revs_path, fs_format[1], min_unpacked_rev_path)
+      print('- unpacking db/revs')
+      compute_unpack_shards(revs_path, fs_format[1], min_unpacked_rev_path)
       min_unpacked_rev = 0
-    else:
-      print('- linearising db/revs')
+    print('- linearising db/revs')
     # Process unpacked shard
     linearise(revs_path)
     print('- linearising db/revprops')
