@@ -9,7 +9,7 @@
 # fsfs-reshard.py REPOS_PATH MAX_FILES_PER_SHARD
 #
 # Perform an offline conversion of an FSFS repository between linear (format
-# 2, usable by Subversion 1.4+) and sharded (format 3/4, usable by Subversion
+# 2, usable by Subversion 1.4+) and sharded (format 3,4,6), usable by Subversion
 # 1.5+) layouts.
 #
 # The MAX_FILES_PER_SHARD argument specifies the maximum number of files
@@ -51,8 +51,9 @@
 #    under the License.
 # ====================================================================
 #
-# Subversion 1.6 format 4 support, unpack operation and shard file
-# computation contributed by Yves Martin (ymartin1040 0x40 gmail 0x2E com)
+# Subversion filesystem format 4 and 6 support for versions 1.6, 1.7, 1.8,
+# unpack operation and shard file computation contributed by Yves Martin
+# (ymartin1040 0x40 gmail 0x2E com)
 #
 # $HeadURL: http://svn.apache.org/repos/asf/subversion/trunk/tools/server-side/fsfs-reshard.py $
 # $LastChangedDate: 2009-11-16 20:07:17 +0100 (Mon, 16 Nov 2009) $
@@ -62,6 +63,8 @@
 import os, stat, sys, shutil
 
 from errno import EEXIST
+from sets import Set
+import ConfigParser
 
 def usage():
   """Print a usage message and exit."""
@@ -112,8 +115,10 @@ def incompatible_fs_format(repos_path, format):
   sys.stderr.write("""error: unable to open repository '%s'.
 
 This repository contains a filesystem that is not compatible with
-this tool.  Valid filesystem formats are '1', '2', or '3'; this
+this tool.  Valid filesystem formats are '1', '2', '3', '4' or '6'; this
 repository contains a filesystem with format '%s'.
+
+Compressed packed revprops is not supported.
 
 """ % (repos_path, format))
   sys.stderr.flush()
@@ -180,6 +185,19 @@ def check_repos_format(repos_path):
     # In all likelihood, the file doesn't exist.
     incompatible_repos_format(repos_path, '<unreadable>')
 
+def is_packed_revprops_compressed(repos_path):
+  """Check if repository at REPOS_PATH has compressed revprops enabled."""
+  fsfsconf_path = os.path.join(repos_path, 'db', 'fsfs.conf')
+  try:
+    config = ConfigParser.ConfigParser()
+    config.read(fsfsconf_path)
+    return config.getboolean('packed-revprops', 'compress-packed-revprops')
+  except IOError:
+    # In all likelihood, the file doesn't exist.
+    incompatible_repos_format(repos_path, '<unreadable>')
+  except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+    return False # Likely section is lacking or option is commented
+
 def check_fs_format(repos_path):
   """Check that REPOS_PATH contains a filesystem with a suitable format,
   or that it contains no format file; print a message and exit if neither
@@ -206,11 +224,7 @@ def check_fs_format(repos_path):
       # but we can't downgrade again (since we can't uncompress any of the
       # svndiff1 deltas that may have been written).  Warn the user and exit.
       warn_about_fs_format_1(repos_path, format_path)
-    if format == '2':
-      pass
-    elif format == '3':
-      pass
-    elif format == '4':
+    if format == '2' or format == '3' or format == '4' or format == '6':
       pass
     else:
       incompatible_fs_format(repos_path, format)
@@ -357,17 +371,37 @@ def shard(path, max_files_per_shard, start, end):
     os.rename(from_path, to_path)
   skipped == 0 and os.rmdir(tmp)
 
-def unpack_shard(packed_path, unpacklinear, first_rev, revs_size):
-  """Compute revision sizes in a packed shard at packed_path
-  and unpack revision except if unpacklinear is false.
-  The first revision of the shard has first_rev number.
-  Revision sizes are stored in rev_sizes dictionnary."""
+def extract_part(source, start_position, end_position, target_file):
+  """Extract source from start to end position to a target file"""
 
   copy_buffer_size = 4096
+  if not os.path.exists(os.path.dirname(target_file)):
+    os.makedirs(os.path.dirname(target_file))
+  target = open(target_file, 'wb')
+  last_position = start_position
+  source.seek(last_position)
+  while last_position < end_position:
+    bytes_tocopy = copy_buffer_size
+    if (end_position - last_position) < copy_buffer_size:
+      bytes_tocopy = end_position - last_position
+    rev_buffer = source.read(bytes_tocopy)
+    target.write(rev_buffer)
+    last_position += len(rev_buffer)
+    if bytes_tocopy < copy_buffer_size:
+      break
+  target.close()
+  return last_position
+
+def unpack_shard(packed_path, shard_number, unpack, first_rev, revs_size):
+  """Compute revision sizes in a packed shard at packed_path and unpack revisions
+  if unpack is True.  The first revision of the shard has first_rev number.
+  Revision sizes are stored in rev_sizes dictionnary.
+
+  """
   manifest = open(os.path.join(packed_path, 'manifest'), 'r')
   pack_path = os.path.join(packed_path, 'pack')
   end_pack = os.path.getsize(pack_path)
-  if unpacklinear:
+  if unpack:
     pack = open(pack_path, 'rb')
   last_position = int(manifest.readline())
   rev_index = first_rev
@@ -379,33 +413,76 @@ def unpack_shard(packed_path, unpacklinear, first_rev, revs_size):
       # last revision: end of pack file
       byte_position = end_pack
     revs_size[rev_index] = byte_position - last_position
-    if unpacklinear:
-      # Extract revision from pack file
-      arev = open(os.path.join(packed_path, os.path.pardir, str(rev_index)), 'wb')
-      pack.seek(last_position)
-      while last_position < byte_position:
-        bytes_tocopy = copy_buffer_size
-        if (byte_position - last_position) < copy_buffer_size:
-          bytes_tocopy = byte_position - last_position
-        rev_buffer = pack.read(bytes_tocopy)
-        arev.write(rev_buffer)
-        last_position += len(rev_buffer)
-        if bytes_tocopy < copy_buffer_size:
-          break
-      arev.close()
+    if unpack:
+      # Extract revision from pack file to corresponding shard
+      arev = os.path.join(packed_path, os.path.pardir, str(shard_number), str(rev_index))
+      last_position = extract_part(pack, last_position, byte_position, arev)
     else:
       last_position = byte_position
     rev_index += 1
   # Close file descriptors
   manifest.close()
-  if unpacklinear:
+  if unpack:
     pack.close()
   return revs_size
 
-def compute_rev_sizes(revs_path, current_shard, unpacklinear):
-  """Compute revision sizes based on current shard capacity
-  Support either linear, sharded or packed revisions.
-  If unpacklinear is True, packed sharded are linearized too."""
+def unpack_revprops_shard(packed_path, shard_number, first_rev):
+  """Unpack a single revision properties shard to linear mode"""
+
+  revprops_packfile = {}
+  packfiles = Set()
+  with open(os.path.join(packed_path, 'manifest'), 'rb') as manifest:
+    for revfile in manifest:
+      revfile = revfile.rstrip('\n')
+      revprops_packfile[first_rev] = revfile
+      packfiles.add(revfile)
+      first_rev += 1
+
+  for apackfile in packfiles:
+    packrevprops = open(os.path.join(packed_path, apackfile), 'rb')
+    packrevprops.read(2) # Skip uncompressed content size
+    # Parse revprops sizes
+    rev = int(packrevprops.readline())
+    rev_count = int(packrevprops.readline())
+    end_rev = rev + rev_count - 1
+    revprop_sizes = {}
+    for r in range(rev, rev + rev_count):
+      revprop_sizes[r] = int(packrevprops.readline())
+    packrevprops.readline()
+    last_position = packrevprops.tell()
+    while rev <= end_rev:
+      end_position = last_position + revprop_sizes[rev]
+      if apackfile == revprops_packfile[rev]:
+        # Extract revprop declared in manifest
+        arev = os.path.join(packed_path, os.path.pardir, str(shard_number), str(rev))
+        last_position = extract_part(packrevprops, last_position, end_position, arev)
+      else:
+        last_position = end_position
+      rev += 1
+    # Close file descriptors
+    packrevprops.close()
+
+def unpack_revprops_shards(revprops_path, current_shard):
+  """Unpack revision properties shards"""
+
+  for root_path, dirnames, filenames in os.walk(revprops_path):
+    if len(dirnames) > 0:
+      for name in dirnames:
+        if (not(name.endswith('.pack'))):
+          continue
+        shard_number = int(name[:-5])
+        shard_path = os.path.join(root_path, name)
+        unpack_revprops_shard(shard_path, shard_number,
+                              current_shard * shard_number if shard_number > 0 else 1)
+        # remove x.pack structure
+        shutil.rmtree(shard_path)
+
+def compute_rev_sizes(revs_path, current_shard, unpack):
+  """Compute revision sizes based on current shard capacity Support either
+  linear, sharded or packed revisions.  If unpack is True, packed sharded are
+  unpacked too.
+
+  """
   revs_size = {}
   for root_path, dirnames, filenames in os.walk(revs_path):
     if len(filenames) > 0:
@@ -422,8 +499,9 @@ def compute_rev_sizes(revs_path, current_shard, unpacklinear):
         shard_number = int(name[:-5])
         shard_path = os.path.join(root_path, name)
         # get revision sizes from packed shard [and unpack]
-        revs_size = unpack_shard(shard_path, unpacklinear, current_shard * shard_number, revs_size)
-        if unpacklinear:
+        revs_size = unpack_shard(shard_path, shard_number, unpack,
+                                 current_shard * shard_number, revs_size)
+        if unpack:
           # remove x.pack structure
           shutil.rmtree(shard_path)
   return revs_size
@@ -453,18 +531,46 @@ def compute_shard_sizes(revs_size, max_files_per_shard):
     print 'Average full-shard size %d. Minimum: %d, Maximum: %d.' \
           % ((shard_size_sum / current_shard), min_shard_size, max_shard_size)
 
-def compute_unpack_shards(revs_path, current_shard, min_unpacked_rev_path):
-  """Linearise packed shards in revs_path directory based on
-  current_shard number of revisions per shard and compute revision sizes.
-  min-unpacked-rev at min_unpacked_rev_path is reset to 0."""
-  # Suffix unpacked shard to prevent conflicts
-  suffix_unpacked_shard(revs_path)
-  # Linearise packed shards
-  compute_rev_sizes(revs_path, current_shard, True)
-  # Reset min-unpacked-rev
-  min_unpacked_rev_file = open(min_unpacked_rev_path, 'wb')
-  min_unpacked_rev_file.write('0\n')
-  min_unpacked_rev_file.close()
+def reset_min_unpacked(min_unpacked_rev_path):
+  """Reset min-unpacked-rev after unpack."""
+  with open(min_unpacked_rev_path, 'wb') as min_unpacked_rev_file:
+    min_unpacked_rev_file.write('0\n')
+
+def print_estimate_shards(repos_path, fs_format, min_unpacked_rev):
+  """Print repository information and computes shard sizes for the specified
+  target
+
+  """
+  fs_format = check_fs_format(repos_path)
+  target_shard = fs_format[1]
+  if len(sys.argv) == 3 and sys.argv[2].startswith('target='):
+    try:
+      target_shard = int(sys.argv[2][7:]) # Remove "target="
+    except ValueError, OverflowError:
+      sys.stderr.write("error: target maximum files per shard ('%s') is not a valid number.\n" \
+                       % sys.argv[2])
+      sys.stderr.flush()
+      sys.exit(1)
+  revs_path = os.path.join(repos_path, 'db', 'revs')
+  sys.stdout.write("Current FSFS db format version ")
+  sys.stdout.write(fs_format[0])
+  if fs_format[1] > 0:
+    sys.stdout.write(" with sharded layout, max files per shard: ")
+    sys.stdout.write(str(fs_format[1]))
+    if min_unpacked_rev > 0:
+      sys.stdout.write(", packed shards: ")
+      sys.stdout.write(str(min_unpacked_rev / fs_format[1]))
+  else:
+    sys.stdout.write(" with linear layout")
+  if target_shard > 0:
+    sys.stdout.write(".\nList of shard sizes for max files per shard = ")
+    sys.stdout.write(str(target_shard))
+    sys.stdout.write("\n")
+    revs_size = compute_rev_sizes(revs_path, fs_format[1], False)
+    compute_shard_sizes(revs_size, target_shard)
+  else:
+    sys.stdout.write(".\n")
+  sys.stdout.flush()
 
 def main():
   if len(sys.argv) < 2:
@@ -488,41 +594,6 @@ def main():
       sys.exit(1)
     min_unpacked_rev_file.close()
 
-  if len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2].startswith('target=')):
-    # Print repository information [and computes shard sizes [for the specified target]]
-    fs_format = check_fs_format(repos_path)
-    target_shard = fs_format[1]
-    if len(sys.argv) == 3:
-      try:
-        target_shard = int(sys.argv[2][7:])
-      except ValueError, OverflowError:
-        sys.stderr.write("error: target maximum files per shard ('%s') is not a valid number.\n" \
-                         % max_files_per_shard)
-        sys.stderr.flush()
-        sys.exit(1)
-    revs_path = os.path.join(repos_path, 'db', 'revs')
-    sys.stdout.write("Current FSFS db format version ")
-    sys.stdout.write(fs_format[0])
-    if fs_format[1] > 0:
-      sys.stdout.write(" with sharded layout, max files per shard: ")
-      sys.stdout.write(str(fs_format[1]))
-      if min_unpacked_rev > 0:
-        sys.stdout.write(", packed shards: ")
-        sys.stdout.write(str(min_unpacked_rev / fs_format[1]))
-    else:
-      sys.stdout.write(" with linear layout")
-    if target_shard > 0:
-      sys.stdout.write(".\nList of shard sizes for max files per shard = ")
-      sys.stdout.write(str(target_shard))
-      sys.stdout.write("\n")
-      revs_size = compute_rev_sizes(revs_path, fs_format[1], False)
-      compute_shard_sizes(revs_size, target_shard)
-    else:
-      sys.stdout.write(".\n")
-    sys.stdout.flush()
-    exit(0)
-
-  max_files_per_shard = sys.argv[2]
   try:
     start = int(sys.argv[3])
     end = int(sys.argv[4])
@@ -539,11 +610,15 @@ def main():
     sys.stderr.flush()
     sys.exit(1)
 
+  if len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2].startswith('target=')):
+    print_estimate_shards(repos_path, fs_format, min_unpacked_rev)
+    sys.exit(0)
+
   try:
-    max_files_per_shard = int(max_files_per_shard)
+    max_files_per_shard = int(sys.argv[2])
   except ValueError, OverflowError:
     sys.stderr.write("error: maximum files per shard ('%s') is not a valid number.\n" \
-      % max_files_per_shard)
+      % sys.argv[2])
     sys.stderr.flush()
     sys.exit(1)
 
@@ -556,12 +631,19 @@ def main():
   # Check the format of the repository.
   check_repos_format(repos_path)
 
+  reshard = max_files_per_shard != fs_format[1]
+  if not reshard:
+    print_estimate_shards(repos_path, fs_format, min_unpacked_rev)
+    sys.exit(0)
+
   # Let the user know what's going on.
   if max_files_per_shard > 0:
     print("Converting '%s' to a sharded structure with %d files per directory" \
       % (repos_path, max_files_per_shard))
-    if fs_format[1]:
-      print('(will convert to a linear structure first)')
+    if min_unpacked_rev > 0:
+      print('(will unpack)')
+    if reshard:
+      print('(will convert to a linear structure)')
   else:
     print("Converting '%s' to a linear structure" % repos_path)
 
@@ -575,23 +657,23 @@ def main():
   if fs_format[1] > 0:
     revs_path = os.path.join(repos_path, 'db', 'revs')
     if min_unpacked_rev > 0:
+      # First unpack
+      if is_packed_revprops_compressed(repos_path):
+        incompatible_fs_format(repos_path, fs_format[0])
       print('- unpacking db/revs')
-      compute_unpack_shards(revs_path, fs_format[1], min_unpacked_rev_path)
+      compute_rev_sizes(revs_path, fs_format[1], True)
+      print('- unpacking db/revprops')
+      unpack_revprops_shards(os.path.join(repos_path, 'db', 'revprops'), fs_format[1])
       min_unpacked_rev = 0
-    print('- linearising db/revs')
-    # Process unpacked shard
-    linearise(revs_path)
-    print('- linearising db/revprops')
-    linearise(os.path.join(repos_path, 'db', 'revprops'))
+      reset_min_unpacked(min_unpacked_rev_path)
+    # If sharding is different, convert to a linear scheme
+    if reshard:
+      print('- linearising db/revs')
+      linearise(revs_path)
+      print('- linearising db/revprops')
+      linearise(os.path.join(repos_path, 'db', 'revprops'))
 
-  if max_files_per_shard == 0:
-    # We're done.  Stamp the filesystem with a format 2/3/4 db/format file.
-    print('- marking the repository as a valid linear repository')
-    format_layout = '\n'
-    if fs_format[0] > 2:
-      format_layout = '\nlayout linear\n'
-    write_fs_format(repos_path, fs_format[0] + format_layout)
-  else:
+  if reshard and max_files_per_shard > 0:
     print('- sharding db/revs')
     shard(os.path.join(repos_path, 'db', 'revs'), max_files_per_shard,
           start, end)
@@ -599,6 +681,14 @@ def main():
     shard(os.path.join(repos_path, 'db', 'revprops'), max_files_per_shard,
           start, end)
 
+  if max_files_per_shard == 0:
+    # We're done.  Stamp the filesystem with a format 2/3/4/6 db/format file.
+    print('- marking the repository as a valid linear repository')
+    format_layout = '\n'
+    if fs_format[0] > 2:
+      format_layout = '\nlayout linear\n'
+    write_fs_format(repos_path, fs_format[0] + format_layout)
+  else:
     # Sharded. Keep original 3/4 format or upgrade format 2 to 3.
     target_format = fs_format[0]
     if fs_format[0] == 2:
