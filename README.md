@@ -30,12 +30,12 @@ it.
   Job is done. Repository revisions are now collated into 1000-items groups.
 
 - Check your repository format version and mode with `fsfs-reshard.py repository`.
-  No change on repository. You should get Current FSFS db format version 4 with
-  sharded layout, max files per shard: 1000.  and the list of effective shard
+  No change on repository. You should get `Current FSFS db format version 4 with
+  sharded layout, max files per shard: 1000`  and the list of effective shard
   sizes.
 
 - To improve disk access, you can pack complete shards into large files with
-  svnadmin pack repository
+  `svnadmin pack repository`
 
 - Check your repository format version and packed mode with `fsfs-reshard.py
   repository`. No change on repository.
