@@ -9,7 +9,7 @@
 # fsfs-reshard.py REPOS_PATH MAX_FILES_PER_SHARD
 #
 # Perform an offline conversion of an FSFS repository between linear (format
-# 2, usable by Subversion 1.4+) and sharded (format 3,4,6), usable by Subversion
+# 2, usable by Subversion 1.4+) and sharded (format 3,4,6,7), usable by Subversion
 # 1.5+) layouts.
 #
 # The MAX_FILES_PER_SHARD argument specifies the maximum number of files
@@ -51,7 +51,7 @@
 #    under the License.
 # ====================================================================
 #
-# Subversion filesystem format 4 and 6 support for versions 1.6, 1.7, 1.8,
+# Subversion filesystem format 4, 6 and 7 support for versions 1.6, 1.7, 1.8 and 1.9,
 # unpack operation and shard file computation contributed by Yves Martin
 # (ymartin1040 0x40 gmail 0x2E com)
 #
@@ -119,6 +119,7 @@ this tool.  Valid filesystem formats are '1', '2', '3', '4' or '6'; this
 repository contains a filesystem with format '%s'.
 
 Compressed packed revprops is not supported.
+Packed shards with logical addressing cannot be analyzed or unpacked.
 
 """ % (repos_path, format))
   sys.stderr.flush()
@@ -142,8 +143,8 @@ def incompatible_fs_format_option(repos_path, option):
   sys.stderr.write("""error: unable to convert repository '%s'.
 
 This repository contains a filesystem that is not compatible with
-this tool.  This tool recognises the 'layout' option but the
-filesystem uses the '%s' option.
+this tool.  This tool recognises the 'layout' and 'addressing'
+options but the filesystem uses the '%s' option.
 
 """ % (repos_path, option))
   sys.stderr.flush()
@@ -198,11 +199,21 @@ def is_packed_revprops_compressed(repos_path):
   except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
     return False # Likely section is lacking or option is commented
 
+def check_packed_shards_logical(fs_format, min_unpacked_rev):
+  """Check if repository with logical addressing has packed shards."""
+  if fs_format[2] == "logical" and min_unpacked_rev > 0:
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    sys.stderr.write("Packed shards with logical addressing cannot be analyzed or unpacked.\n")
+    sys.stderr.flush()
+    sys.exit(1)
+  return False
+
 def check_fs_format(repos_path):
   """Check that REPOS_PATH contains a filesystem with a suitable format,
   or that it contains no format file; print a message and exit if neither
   is true.  Return an array [format number, shard size] whether the filesystem is sharded."""
-  result = [0, 0]
+  result = [0, 0, None]
   db_path = os.path.join(repos_path, 'db')
   format_path = os.path.join(db_path, 'format')
   if not(os.path.exists(format_path)):
@@ -224,7 +235,7 @@ def check_fs_format(repos_path):
       # but we can't downgrade again (since we can't uncompress any of the
       # svndiff1 deltas that may have been written).  Warn the user and exit.
       warn_about_fs_format_1(repos_path, format_path)
-    if format == '2' or format == '3' or format == '4' or format == '6':
+    if format == '2' or format == '3' or format == '4' or format == '6' or format == '7':
       pass
     else:
       incompatible_fs_format(repos_path, format)
@@ -240,6 +251,8 @@ def check_fs_format(repos_path):
         pass
       elif line.startswith('layout sharded '):
         result[1] = int(line[15:])
+      elif line.startswith('addressing '):
+        result[2] = line[11:]
       else:
         incompatible_fs_format_option(repos_path, line)
 
@@ -279,9 +292,9 @@ def backup_fs_format(repos_path):
     os.remove(format_bak_path)
     os.rename(format_path, format_bak_path)
 
-def write_fs_format(repos_path, contents):
-  """Write a new filesystem format file for repository REPOS_PATH containing
-  CONTENTS."""
+def write_fs_format(repos_path, fs_format):
+  """Write a new filesystem format file for repository REPOS_PATH
+  according to fs_format information."""
   format_path = os.path.join(repos_path, 'db', 'format')
   format_bak_path = os.path.join(repos_path, 'db', 'format.bak')
   # Permissions and owner/group are preserved with rename
@@ -291,7 +304,15 @@ def write_fs_format(repos_path, contents):
     # Unexpected but try to go on
     os.remove(format_path)
   f = open(format_path, 'wb')
-  f.write(contents)
+  f.write(fs_format[0])  # Version
+  f.write('\n')
+  if fs_format[0] > 2:
+    if fs_format[1] > 0:
+      f.write('layout sharded %d\n' % fs_format[1])
+    else:
+      f.write('layout linear\n')
+  if fs_format[0] > 6 and fs_format[2] != None:
+    f.write('addressing %s\n' % fs_format[2])
   f.close()
 
 def suffix_unpacked_shard(path):
@@ -562,6 +583,9 @@ def print_estimate_shards(repos_path, fs_format, min_unpacked_rev):
       sys.stdout.write(str(min_unpacked_rev / fs_format[1]))
   else:
     sys.stdout.write(" with linear layout")
+
+  check_packed_shards_logical(fs_format, min_unpacked_rev) # and exits if so
+
   if target_shard > 0:
     sys.stdout.write(".\nList of shard sizes for max files per shard = ")
     sys.stdout.write(str(target_shard))
@@ -636,6 +660,8 @@ def main():
     print_estimate_shards(repos_path, fs_format, min_unpacked_rev)
     sys.exit(0)
 
+  check_packed_shards_logical(fs_format, min_unpacked_rev) # and exits if so
+
   # Let the user know what's going on.
   if max_files_per_shard > 0:
     print("Converting '%s' to a sharded structure with %d files per directory" \
@@ -681,21 +707,16 @@ def main():
     shard(os.path.join(repos_path, 'db', 'revprops'), max_files_per_shard,
           start, end)
 
+  fs_format[1] = max_files_per_shard
   if max_files_per_shard == 0:
-    # We're done.  Stamp the filesystem with a format 2/3/4/6 db/format file.
     print('- marking the repository as a valid linear repository')
-    format_layout = '\n'
-    if fs_format[0] > 2:
-      format_layout = '\nlayout linear\n'
-    write_fs_format(repos_path, fs_format[0] + format_layout)
   else:
     # Sharded. Keep original 3/4 format or upgrade format 2 to 3.
-    target_format = fs_format[0]
     if fs_format[0] == 2:
-      target_format = 3
-    # We're done.  Stamp the filesystem with a format db/format file.
+      fs_format[0] = 3
     print('- marking the repository as a valid sharded repository')
-    write_fs_format(repos_path, target_format + '\nlayout sharded %d\n' % max_files_per_shard)
+  # We're done.  Stamp the filesystem with a format 2/3/4/6/7 db/format file.
+  write_fs_format(repos_path, fs_format)
 
   print('- done.')
   sys.exit(0)
